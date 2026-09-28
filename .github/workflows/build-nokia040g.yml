@@ -77,13 +77,29 @@ jobs:
           echo "--- after cleanup ---"
           df -h /
 
-      - name: Add 8G swap (编译峰值内存保护)
+      - name: Add swap (best effort, 失败不阻塞)
+        continue-on-error: true
         run: |
-          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          echo "--- 当前 swap ---"
+          swapon --show || true
           free -h
+          have=$(free -m | awk '/^Swap:/ {print $2}')
+          echo "现有 swap = ${have:-0} MB"
+          if [ "${have:-0}" -lt 4096 ]; then
+            # 注意：GitHub runner 镜像自带 /swapfile（已 swapon），复用它会 Text file busy
+            echo "不足 4G，追加 /swapfile-extra"
+            set +e
+            sudo fallocate -l 4G /swapfile-extra || sudo dd if=/dev/zero of=/swapfile-extra bs=1M count=4096
+            sudo chmod 600 /swapfile-extra
+            sudo mkswap /swapfile-extra
+            sudo swapon /swapfile-extra
+            set -e
+          else
+            echo "现有 swap 已足够，跳过"
+          fi
+          swapon --show || true
+          free -h
+          df -h /
 
       - name: Install build dependencies
         env:
