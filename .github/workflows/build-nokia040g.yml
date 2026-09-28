@@ -1,0 +1,255 @@
+name: Build PonWrt (Nokia XG-040G)
+
+# 针对 Nokia XG-040G-MD（an7581）/ XG-040G-MF（an7583）的云编译
+# 相对作者原版 release.yml 的改动：
+#   1) 去掉 environment: release（避免 fork 后卡 waiting for approval）
+#   2) 可选只编单个 SoC（matrix 动态生成）
+#   3) ccache 缓存 + dl 缓存（第二次编译显著加速）
+#   4) 磁盘/内存保护：清 dotnet·android·ghc、建 8G swap、每步打印 df
+#   5) 精简 device profile（an7581 只留 nokia_xg-040g-md*，见 configs/custom-devices-an7581.config）
+#   6) release_tag 留空则只出 Artifacts，填了才建 Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: '要编译的 SoC'
+        required: true
+        default: both
+        type: choice
+        options:
+          - both
+          - an7581
+          - an7583
+      release_tag:
+        description: '留空=只上传 Artifacts；填了则建 Release，例如 v2026.09-nokia040g'
+        required: false
+        default: ''
+        type: string
+      prerelease:
+        description: 'Release 标为 prerelease'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-ponwrt-${{ github.ref }}-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  prep:
+    name: Resolve targets
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        run: |
+          if [ "${{ inputs.target }}" = "both" ]; then
+            echo 'matrix={"target":["an7581","an7583"]}' >> "$GITHUB_OUTPUT"
+          else
+            echo "matrix={\"target\":[\"${{ inputs.target }}\"]}" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: prep
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prep.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Free disk space & report
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost \
+                      /opt/hostedtoolcache/CodeQL /usr/local/lib/node_modules 2>/dev/null || true
+          sudo apt-get clean
+          echo "--- after cleanup ---"
+          df -h /
+
+      - name: Add 8G swap (编译峰值内存保护)
+        run: |
+          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk \
+            gettext git g++-multilib gcc-multilib gperf help2man intltool \
+            libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev \
+            libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libyaml-dev lld llvm ninja-build p7zip-full patch pkgconf \
+            python3 python3-docutils python3-pip python3-ply \
+            python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion \
+            swig texinfo uglifyjs unzip wget xmlto xxd zlib1g-dev zstd
+          ccache --version | head -2
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ matrix.target }}-
+
+      - name: Cache downloads (dl/)
+        uses: actions/cache@v4
+        with:
+          path: dl
+          key: dl-${{ matrix.target }}-${{ hashFiles('feeds.conf.default', 'configs/*.config') }}
+          restore-keys: |
+            dl-${{ matrix.target }}-
+
+      - name: Install feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Load signing key (optional)
+        env:
+          PONWRT_APK_PRIVATE_KEY: ${{ secrets.PONWRT_APK_PRIVATE_KEY }}
+        run: |
+          if [ -n "$PONWRT_APK_PRIVATE_KEY" ]; then
+            umask 077
+            printf '%s\n' "$PONWRT_APK_PRIVATE_KEY" > private-key.pem
+            openssl ec -in private-key.pem -pubout -out public-key.pem
+            echo "已加载 apk 签名私钥"
+          else
+            echo "::notice::未设置 PONWRT_APK_PRIVATE_KEY —— 继续编译，固件包不做签名"
+          fi
+
+      - name: Configure ${{ matrix.target }}
+        run: |
+          set -e
+          T="${{ matrix.target }}"
+          # 注意：scripts/kconfig.pl 的 "+" 是二元操作符，一次只能合并两个文件，
+          # 传 3 个及以上会报 "Parse error"（已本地实测）。所以这里用链式合并。
+          ./scripts/kconfig.pl + "configs/${T}.config" configs/release.config > .config
+          for extra in configs/custom-extra.config "configs/custom-devices-${T}.config"; do
+            if [ -f "$extra" ]; then
+              echo "链式合并追加: $extra"
+              ./scripts/kconfig.pl + .config "$extra" > .config.step
+              mv .config.step .config
+            fi
+          done
+          make defconfig
+          echo "--- 生效的 device profile ---"
+          grep -E '^CONFIG_TARGET_DEVICE_.*=y' .config || true
+          echo "--- ccache / target ---"
+          grep -E '^(CONFIG_CCACHE|CONFIG_CCACHE_DIR|CONFIG_TARGET_airoha)' .config || true
+
+      - name: Verify requested extra packages took effect
+        run: |
+          set -e
+          missing=0
+          for cfg in configs/custom-extra.config "configs/custom-devices-${{ matrix.target }}.config"; do
+            if [ ! -f "$cfg" ]; then continue; fi
+            while read -r line; do
+              case "$line" in
+                \#*|"") continue ;;
+              esac
+              sym="${line%%=*}"
+              if grep -qx "${sym}=y" .config; then
+                echo "OK   $sym"
+              else
+                echo "::warning::未生效（符号不存在或依赖未满足，请核对包名）: $sym"
+                missing=$((missing+1))
+              fi
+            done < "$cfg"
+          done
+          echo "请求的自定义项中未生效数量: $missing"
+
+      - name: Download sources
+        run: make download -j"$(nproc)"
+
+      - name: Build ${{ matrix.target }}
+        run: |
+          set -o pipefail
+          ( make -j"$(nproc)" 2>&1 | tee /tmp/build.log | tail -n 30 ) || {
+            echo "=== 编译失败：日志末尾 300 行 ==="
+            tail -n 300 /tmp/build.log
+            exit 1
+          }
+
+      - name: ccache statistics
+        run: ccache -s || true
+
+      - name: Check disk after build
+        run: df -h /
+
+      - name: Pack ${{ matrix.target }}
+        run: |
+          set -e
+          T="${{ matrix.target }}"
+          test -d "bin/targets/airoha/${T}" || { echo "::error::产物目录不存在 bin/targets/airoha/${T}"; find bin/targets -maxdepth 3 | head -50; exit 1; }
+          mkdir -p release
+          tar --zstd -cf "release/ponwrt-${T}-nokia040g.tar.zst" -C bin/targets/airoha "${T}"
+          find release -maxdepth 1 -type f -printf '%p  %s bytes\n'
+          # 额外把 lzma/sysupgrade 单文件也列出来，方便核对
+          find "bin/targets/airoha/${T}" -maxdepth 1 -type f \( -name '*.itb' -o -name '*sysupgrade*' -o -name '*.bin' \) -printf '%f\t%s\n' | head -40 || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ponwrt-${{ matrix.target }}-nokia040g
+          path: release/*.tar.zst
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Create release
+    needs: build
+    if: ${{ inputs.release_tag != '' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download firmware archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ponwrt-*-nokia040g
+          path: release
+          merge-multiple: true
+
+      - name: Create checksums
+        working-directory: release
+        run: |
+          sha256sum ./*.tar.zst > sha256sums
+          cat sha256sums
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -e
+          args=(
+            "$RELEASE_TAG"
+            release/*.tar.zst
+            release/sha256sums
+            --repo "$GITHUB_REPOSITORY"
+            --target "$GITHUB_SHA"
+            --title "PonWrt $RELEASE_TAG (Nokia XG-040G)"
+            --generate-notes
+          )
+          if [ "$PRERELEASE" = "true" ]; then args+=(--prerelease); fi
+          gh release create "${args[@]}"
